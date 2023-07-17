@@ -1,7 +1,10 @@
+use cgmath::{Vector2, Rad, Matrix3, Vector3, Matrix4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::window::Window;
+
+use crate::camera::Camera;
 
 pub struct GpuState {
     surface: wgpu::Surface,
@@ -16,6 +19,8 @@ pub struct GpuState {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
+    camera: Camera,
+    transform_bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
@@ -25,7 +30,6 @@ struct Vertex {
     tex_coords: [f32; 2],
 }
 
-// lib.rs
 impl Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -58,6 +62,24 @@ const INDICES: &[u16] = &[
     0, 1, 2,
     0, 2, 3,
 ];
+
+// Define a function to create the transformation matrix
+fn create_transform_matrix(position: Vector2<f32>, scale: Vector2<f32>, rotation: Rad<f32>) -> Matrix3<f32> {
+    let translation = Matrix3::from_translation(position);
+    let scaling = Matrix3::from_nonuniform_scale(scale.x, scale.y);
+    let rotation = Matrix3::from_angle_z(rotation);
+
+    translation * scaling * rotation
+}
+
+// Image size relative to window size
+fn calculate_scale_factor(window_size: Vector2<f32>, pixel_size: Vector2<f32>) -> Vector2<f32> {
+    let scale_factor = Vector2::new(
+        pixel_size.x / window_size.x,
+        pixel_size.y / window_size.y,
+    );
+    scale_factor
+}
 
 impl GpuState {
     pub async fn new(window: Window) -> Self {
@@ -213,10 +235,82 @@ impl GpuState {
         );
                             
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        let camera = Camera::new(&device, &device, config.width, config.height);
+
+        // Define the position, scale, and rotation of the image
+        let position = Vector2::new(100.0, 100.0);
+        let pixel_size = Vector2::new(dimensions.0 as f32, dimensions.1 as f32);
+        let scale_factor = calculate_scale_factor(
+            Vector2::new(
+                window.inner_size().width as f32,
+                 window.inner_size().height as f32),
+            pixel_size,
+        );
+
+        // Create the transformation matrix
+        let transform_matrix = create_transform_matrix(position, scale_factor, Rad(0.0));// Define the position, scale, and rotation of the image
+        let matrix4: Matrix4<f32> = transform_matrix.into(); // Convert to a 4x4 matrix
+        let matrix_array: [[f32; 4]; 4] = matrix4.into();
+
+        dbg!(matrix_array);
+
+        #[repr(C)]
+        #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        pub struct ImageUniform {
+            transform: [[f32; 4]; 4],
+        }
+
+        let transform_uniform = ImageUniform { transform: matrix_array };
+
+
+        let transform_buffer = device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Camera Buffer"),
+                    contents: bytemuck::cast_slice(&[transform_uniform]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                }
+            );
+
+        let transform_bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer { 
+                            ty: wgpu::BufferBindingType::Uniform, 
+                            has_dynamic_offset: false, 
+                            min_binding_size: None, 
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("transform_bind_group_layout"),
+            }
+        );
+
+        let transform_bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &transform_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: transform_buffer.as_entire_binding(),
+                    },
+                ],
+                label: Some("transform_bind_group"),
+            }
+        );
+        
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
+                bind_group_layouts: &[
+                    &texture_bind_group_layout, 
+                    &camera.bind_group_layout(),
+                    &transform_bind_group_layout,
+                ],
                 push_constant_ranges: &[],
             });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -287,6 +381,8 @@ impl GpuState {
             index_buffer,
             num_indices: INDICES.len() as u32,
             diffuse_bind_group,
+            camera,
+            transform_bind_group,
         }
     }
 
@@ -308,10 +404,11 @@ impl GpuState {
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
-        false
+        self.camera.controller().process_events(event)
     }
 
     pub fn update(&mut self) {
+        self.camera.update(&self.queue);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -337,6 +434,8 @@ impl GpuState {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.camera.bind_group(), &[]);
+            render_pass.set_bind_group(2, &self.transform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);

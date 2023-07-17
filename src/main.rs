@@ -1,4 +1,5 @@
 mod gpu_state;
+mod camera;
 
 use wgpu::SurfaceError;
 use winit::{
